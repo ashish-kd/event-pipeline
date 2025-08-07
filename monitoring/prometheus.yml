@@ -1,0 +1,70 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Signal Emitter Service
+  - job_name: 'signal-emitter'
+    static_configs:
+      - targets: ['signal-emitter:8001']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+  # Signal Processor Service
+  - job_name: 'signal-processor'
+    static_configs:
+      - targets: ['signal-processor:8001']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+  # Anomaly Detector Service
+  - job_name: 'anomaly-detector'
+    static_configs:
+      - targets: ['anomaly-detector:8001']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+  # API Service
+  - job_name: 'api'
+    static_configs:
+      - targets: ['api:8001']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+  # Custom application endpoints for health checks
+  - job_name: 'signal-emitter-health'
+    static_configs:
+      - targets: ['signal-emitter:8000']
+    metrics_path: '/health'
+    scrape_interval: 30s
+
+  - job_name: 'signal-processor-health'
+    static_configs:
+      - targets: ['signal-processor:8000']
+    metrics_path: '/health'
+    scrape_interval: 30s
+
+  - job_name: 'anomaly-detector-health'
+    static_configs:
+      - targets: ['anomaly-detector:8000']
+    metrics_path: '/health'
+    scrape_interval: 30s
+
+  - job_name: 'api-health'
+    static_configs:
+      - targets: ['api:8000']
+    metrics_path: '/health'
+    scrape_interval: 30s 
