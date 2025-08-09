@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from asyncio import Queue
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
@@ -411,45 +412,56 @@ class AnomalyDetector:
         active_user_sessions.set(len(self.user_sessions))
     
     async def consume_and_detect(self):
-        """Main consumer loop for anomaly detection."""
-        logger.info("Starting anomaly detection...")
-        
+        """Main consumer loop for anomaly detection with concurrent workers."""
+        logger.info("Starting anomaly detection with concurrency...")
+
+        queue: Queue = Queue(maxsize=2000)
+
+        async def enqueue_signals():
+            while True:
+                message_pack = self.consumer.poll(timeout_ms=500, max_records=50)
+                for _, messages in message_pack.items():
+                    for message in messages:
+                        await queue.put(message.value)
+                await asyncio.sleep(0)
+
+        async def worker(worker_id: int):
+            while True:
+                signal = await queue.get()
+                try:
+                    anomalies = await self.process_signal(signal)
+                    # Fire off store and publish for each anomaly concurrently
+                    for anomaly in anomalies:
+                        await asyncio.gather(
+                            self.store_anomaly(anomaly),
+                            self.publish_anomaly(anomaly)
+                        )
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} error: {e}")
+                finally:
+                    queue.task_done()
+
+        workers = [asyncio.create_task(worker(i)) for i in range(4)]
+        producer_task = asyncio.create_task(enqueue_signals())
+
         try:
             while True:
-                # Poll for messages
-                message_pack = self.consumer.poll(timeout_ms=1000, max_records=10)
-                
-                for topic_partition, messages in message_pack.items():
-                    for message in messages:
-                        try:
-                            signal = message.value
-                            
-                            # Detect anomalies
-                            anomalies = await self.process_signal(signal)
-                            
-                            # Process each detected anomaly
-                            for anomaly in anomalies:
-                                await asyncio.gather(
-                                    self.store_anomaly(anomaly),
-                                    self.publish_anomaly(anomaly)
-                                )
-                        
-                        except Exception as e:
-                            logger.error(f"Error processing message: {e}")
-                
                 # Periodic cleanup
                 current_time = time.time()
                 if current_time - self.last_cleanup > self.cleanup_interval:
                     self.cleanup_old_sessions()
                     self.last_cleanup = current_time
-                
-                # Small sleep to prevent busy waiting
-                await asyncio.sleep(0.01)
-                
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            logger.info("Anomaly detection cancelled")
         except Exception as e:
             logger.error(f"Error in anomaly detection loop: {e}")
             raise
         finally:
+            producer_task.cancel()
+            for w in workers:
+                w.cancel()
+            await queue.join()
             if self.consumer:
                 self.consumer.close()
             if self.producer:

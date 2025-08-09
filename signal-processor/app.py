@@ -137,9 +137,14 @@ class SignalProcessor:
             INSERT INTO signals (user_id, type, timestamp, payload)
             VALUES ($1, $2, $3, $4::jsonb)
             """
-            
-            async with self.db_pool.acquire() as conn:
-                await conn.executemany(insert_query, records)
+
+            # Chunk and insert concurrently using the pool
+            chunk_size = 500
+            chunks = [records[i:i+chunk_size] for i in range(0, len(records), chunk_size)]
+            async def insert_chunk(chunk):
+                async with self.db_pool.acquire() as conn:
+                    await conn.executemany(insert_query, chunk)
+            await asyncio.gather(*(insert_chunk(c) for c in chunks))
             
             # Record processing stats
             processing_time_ms = int((time.time() - start_time) * 1000)

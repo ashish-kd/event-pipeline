@@ -5,37 +5,24 @@ A high-performance, Kafka-backed event processing pipeline built with Python mic
 ## 🏗️ Architecture
 
 ```
-┌─────────────────┐    ┌──────────────┐    ┌─────────────────┐
-│   Signal        │    │    Kafka     │    │   Signal        │
-│   Emitter       ├───▶│   Cluster    ├───▶│   Processor     │
-│   (FastAPI)     │    │              │    │   (Consumer)    │
-└─────────────────┘    └──────┬───────┘    └─────────────────┘
-                              │                       │
-                              │                       ▼
-                              │              ┌─────────────────┐
-                              │              │   PostgreSQL    │
-                              │              │   Database      │
-                              │              └─────────────────┘
-                              │                       ▲
-                              ▼                       │
-                    ┌─────────────────┐              │
-                    │   Anomaly       │              │
-                    │   Detector      ├──────────────┘
-                    │   (ML Rules)    │
-                    └─────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │   REST API      │
-                    │   Service       │
-                    │   (FastAPI)     │
-                    └─────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────┐
-                    │   Monitoring    │
-                    │ Prometheus +    │
-                    │   Grafana       │
+┌─────────────────┐    ┌──────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Signal        │    │    Kafka     │    │   Signal        │    │   PostgreSQL    │
+│   Emitter       ├───▶│ (KRaft mode) │───▶│   Processor     ├───▶│   Database      │
+│   (FastAPI)     │    │ (no ZK)      │    │   (Consumer)    │    │   (Storage)     │
+└─────────────────┘    └──────┬───────┘    └─────────────────┘    └─────────────────┘
+                              │                       │                       │
+                              │                       ▼                       │
+                              │              ┌─────────────────┐              │
+                              │              │   Anomaly       │              │
+                              │              │   Detector      │              │
+                              │              │ (Concurrent)    │              │
+                              │              └─────────────────┘              │
+                              │                       │                       │
+                              ▼                       ▼                       ▼
+                    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+                    │   REST API      │    │   Prometheus    │    │   Grafana       │
+                    │   Service       │    │   (scrapes)     │    │   (dashboards)  │
+                    │   (Query)       │    └─────────────────┘    └─────────────────┘
                     └─────────────────┘
 ```
 
@@ -45,7 +32,7 @@ A high-performance, Kafka-backed event processing pipeline built with Python mic
 2. **Signal Processor** - Kafka consumer with batch processing and PostgreSQL storage
 3. **Anomaly Detector** - Rule-based anomaly detection with real-time processing
 4. **REST API** - Query interface for signals, anomalies, and metrics
-5. **Monitoring** - Prometheus metrics collection and Grafana dashboards
+5. **Monitoring** - Prometheus scrapes service metrics; Grafana visualizes
 6. **Database** - PostgreSQL with optimized schema and indexing
 
 ## 🚀 Quick Start
@@ -63,14 +50,18 @@ A high-performance, Kafka-backed event processing pipeline built with Python mic
 git clone <repository-url>
 cd event-pipeline
 
-# Start the entire stack
-docker-compose up -d
+# First run (or after Kafka config changes): clean volumes for a fresh KRaft cluster
+docker compose down -v
+
+# Build and start the entire stack
+docker compose up -d --build
 
 # Check services status
-docker-compose ps
+docker compose ps
 
 # View logs
-docker-compose logs -f signal-emitter
+docker compose logs -f kafka | cat
+docker compose logs -f signal-emitter | cat
 ```
 
 ### Access Points
@@ -79,6 +70,11 @@ docker-compose logs -f signal-emitter
 - **Prometheus**: http://localhost:9090
 - **REST API**: http://localhost:8000
 - **API Documentation**: http://localhost:8000/docs
+- **Metrics (host ports)**:
+  - Signal Emitter: http://localhost:8011/metrics
+  - Signal Processor: http://localhost:8012/metrics
+  - Anomaly Detector: http://localhost:8013/metrics
+  - API Service: http://localhost:8010/metrics
 
 ## 📊 Services Overview
 
@@ -91,12 +87,13 @@ docker-compose logs -f signal-emitter
 ### Signal Processor Service
 - **Port**: 8000 (API), 8001 (Metrics)
 - **Purpose**: Consume and store signals in PostgreSQL
-- **Features**: Batch processing, dead letter queue, connection pooling
+- **Features**: Batch processing, concurrent chunked inserts, dead letter queue, connection pooling
 - **Batch Size**: Configurable (default 100)
 
 ### Anomaly Detector Service
 - **Port**: 8000 (API), 8001 (Metrics)
 - **Purpose**: Real-time anomaly detection
+- **Concurrency**: Concurrent detection + store/publish workers
 - **Rules**: 
   - High login frequency (>10/minute)
   - Large purchases (>$1000)
@@ -117,6 +114,9 @@ docker-compose logs -f signal-emitter
 | Signal Emitter | `SIGNALS_PER_SECOND` | 1000 | Events per second to generate |
 | Signal Emitter | `BURST_MODE` | false | Enable burst traffic simulation |
 | Signal Processor | `BATCH_SIZE` | 100 | Batch size for processing |
+| Signal Emitter | `EMITTER_WORKERS` | 4 | Number of concurrent Kafka send workers |
+| Signal Emitter | `EMITTER_QUEUE_MAXSIZE` | 10000 | Max in-memory queue size |
+| Signal Emitter | `EMITTER_FLUSH_EVERY` | 1000 | Flush Kafka producer after N sends |
 | All Services | `KAFKA_BOOTSTRAP_SERVERS` | kafka:29092 | Kafka connection |
 | All Services | `DATABASE_URL` | postgres://... | PostgreSQL connection |
 

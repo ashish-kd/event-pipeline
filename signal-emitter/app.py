@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+from asyncio import Queue, Semaphore
 from datetime import datetime
 from typing import Dict, List
 
@@ -28,6 +29,9 @@ class SignalGenerator:
         self.kafka_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
         self.signals_per_second = int(os.getenv('SIGNALS_PER_SECOND', '1000'))
         self.burst_mode = os.getenv('BURST_MODE', 'false').lower() == 'true'
+        self.worker_count = int(os.getenv('EMITTER_WORKERS', '4'))
+        self.queue_maxsize = int(os.getenv('EMITTER_QUEUE_MAXSIZE', '10000'))
+        self.flush_every = int(os.getenv('EMITTER_FLUSH_EVERY', '1000'))
         self.topic = 'signal-events'
         
         # User behavior patterns
@@ -149,54 +153,70 @@ class SignalGenerator:
         
         return signal
     
-    async def produce_signals(self):
-        """Main signal production loop."""
-        logger.info("Starting signal production...")
-        
-        interval = 1.0 / self.signals_per_second
-        batch_size = min(100, self.signals_per_second // 10)  # Process in batches
-        
-        try:
-            while True:
-                start_time = time.time()
-                
-                # Generate batch of signals
-                for _ in range(batch_size):
-                    with signal_latency.time():
-                        signal = self.generate_signal()
-                        signal = self._add_anomaly_patterns(signal)
-                        
-                        # Send to Kafka
-                        future = self.producer.send(
-                            self.topic,
-                            value=signal,
-                            key=signal['user_id']
-                        )
-                        
-                        signals_produced.labels(signal_type=signal['type']).inc()
-                
-                # Flush to ensure delivery
-                self.producer.flush()
-                
-                # Control rate
-                elapsed = time.time() - start_time
-                sleep_time = max(0, (batch_size * interval) - elapsed)
-                
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
-                
-                if self.burst_mode and random.random() < 0.1:  # 10% chance of burst
-                    logger.info("Entering burst mode...")
-                    for _ in range(batch_size * 5):  # 5x burst
-                        signal = self.generate_signal()
-                        self.producer.send(self.topic, value=signal, key=signal['user_id'])
-                        signals_produced.labels(signal_type=signal['type']).inc()
+    async def _enqueue_signals(self, queue: Queue):
+        """Rate-controlled producer that enqueues generated signals."""
+        interval = 1.0 / max(self.signals_per_second, 1)
+        batch_size = max(1, min(1000, self.signals_per_second // 10 or 1))
+        logger.info(f"Signal enqueue loop started: interval={interval:.6f}s batch_size={batch_size}")
+
+        while True:
+            start_time = time.time()
+            for _ in range(batch_size):
+                with signal_latency.time():
+                    signal = self.generate_signal()
+                    signal = self._add_anomaly_patterns(signal)
+                    await queue.put(signal)
+            # Rate control to maintain target throughput
+            elapsed = time.time() - start_time
+            sleep_time = max(0.0, (batch_size * interval) - elapsed)
+            if sleep_time:
+                await asyncio.sleep(sleep_time)
+
+            # Optional burst mode
+            if self.burst_mode and random.random() < 0.1:
+                for _ in range(batch_size * 5):
+                    signal = self.generate_signal()
+                    await queue.put(signal)
+
+    async def _send_worker(self, queue: Queue, worker_id: int, flush_every: int):
+        """Worker that sends signals from queue to Kafka concurrently."""
+        sent_since_flush = 0
+        while True:
+            signal = await queue.get()
+            try:
+                # Non-blocking send; KafkaProducer buffers internally
+                self.producer.send(self.topic, value=signal, key=signal['user_id'])
+                signals_produced.labels(signal_type=signal['type']).inc()
+                sent_since_flush += 1
+                if sent_since_flush >= flush_every:
                     self.producer.flush()
-                    
+                    sent_since_flush = 0
+            except Exception as exc:
+                logger.error(f"Worker {worker_id} failed to send signal: {exc}")
+            finally:
+                queue.task_done()
+
+    async def produce_signals(self):
+        """Main concurrent signal production pipeline."""
+        logger.info(
+            f"Starting signal production with workers={self.worker_count}, queue_maxsize={self.queue_maxsize}"
+        )
+
+        queue: Queue = Queue(maxsize=self.queue_maxsize)
+        workers = [asyncio.create_task(self._send_worker(queue, i, self.flush_every)) for i in range(self.worker_count)]
+        enqueue_task = asyncio.create_task(self._enqueue_signals(queue))
+
+        try:
+            await asyncio.gather(enqueue_task, *workers)
+        except asyncio.CancelledError:
+            logger.info("Signal production cancelled")
         except Exception as e:
             logger.error(f"Error in signal production: {e}")
             raise
         finally:
+            # Drain pending messages and flush
+            await queue.join()
+            self.producer.flush()
             self.producer.close()
 
 # FastAPI app for health checks and metrics
