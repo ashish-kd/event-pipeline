@@ -5,9 +5,10 @@ import os
 import time
 from datetime import datetime
 from typing import List, Dict, Any
+from dateutil import parser as date_parser
 
 import asyncpg
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 import uvicorn
 from fastapi import FastAPI
@@ -19,11 +20,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Prometheus metrics
-events_processed = Counter('events_processed_total', 'Total events processed', ['status'])
-processing_latency = Histogram('processing_latency_seconds', 'Event processing latency')
-batch_size_gauge = Gauge('batch_size_current', 'Current batch size being processed')
-db_connection_pool_size = Gauge('db_connection_pool_size', 'Database connection pool size')
+# Prometheus metrics per specification
+signals_consumed_total = Counter('signals_consumed_total', 'Total signals consumed')
+db_write_failures_total = Counter('db_write_failures_total', 'Total database write failures')
+processing_latency_seconds = Histogram('processing_latency_seconds', 'Processing latency in seconds')
+consumer_lag = Gauge('consumer_lag', 'Consumer lag')
+signals_dlq_total = Counter('signals_dlq_total', 'Total signals sent to DLQ')
 
 class SignalProcessor:
     def __init__(self):
@@ -31,13 +33,15 @@ class SignalProcessor:
         self.database_url = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/eventpipeline')
         self.batch_size = int(os.getenv('BATCH_SIZE', '100'))
         self.topic = 'signal-events'
+        self.dlq_topic = 'signal-events-dlq'
         self.group_id = 'signal-processor'
         
         # Database connection pool
         self.db_pool = None
         
-        # Consumer
+        # Kafka consumer and DLQ producer
         self.consumer = None
+        self.dlq_producer = None
         
         logger.info(f"Signal processor initialized - batch size: {self.batch_size}")
     
@@ -51,52 +55,14 @@ class SignalProcessor:
                 command_timeout=60
             )
             logger.info("Database connection pool initialized")
-            db_connection_pool_size.set(20)  # max_size
-            
-            # Ensure tables exist
-            await self.create_tables()
             
         except Exception as e:
             logger.error(f"Failed to initialize database pool: {e}")
             raise
     
-    async def create_tables(self):
-        """Create database tables if they don't exist."""
-        create_signals_table = """
-        CREATE TABLE IF NOT EXISTS signals (
-            id BIGSERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            type VARCHAR(50) NOT NULL,
-            timestamp BIGINT NOT NULL,
-            payload JSONB NOT NULL,
-            processed_at TIMESTAMP DEFAULT NOW(),
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        
-        CREATE INDEX IF NOT EXISTS idx_signals_user_id ON signals(user_id);
-        CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(type);
-        CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_signals_processed_at ON signals(processed_at);
-        CREATE INDEX IF NOT EXISTS idx_signals_payload_gin ON signals USING GIN(payload);
-        """
-        
-        create_processing_stats = """
-        CREATE TABLE IF NOT EXISTS processing_stats (
-            id BIGSERIAL PRIMARY KEY,
-            batch_size INTEGER NOT NULL,
-            processing_time_ms INTEGER NOT NULL,
-            events_count INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        """
-        
-        async with self.db_pool.acquire() as conn:
-            await conn.execute(create_signals_table)
-            await conn.execute(create_processing_stats)
-            logger.info("Database tables created/verified")
-    
-    def init_kafka_consumer(self):
-        """Initialize Kafka consumer."""
+    def init_kafka(self):
+        """Initialize Kafka consumer and DLQ producer."""
+        # Consumer
         self.consumer = KafkaConsumer(
             self.topic,
             bootstrap_servers=self.kafka_servers,
@@ -104,111 +70,120 @@ class SignalProcessor:
             value_deserializer=lambda m: json.loads(m.decode('utf-8')),
             key_deserializer=lambda k: k.decode('utf-8') if k else None,
             auto_offset_reset='latest',
-            enable_auto_commit=False,
-            max_poll_records=self.batch_size,
-            fetch_min_bytes=1024,
-            fetch_max_wait_ms=500,
-            session_timeout_ms=30000,
-            heartbeat_interval_ms=10000
+            enable_auto_commit=False,  # Per specification
+            max_poll_records=self.batch_size
         )
-        logger.info(f"Kafka consumer initialized for topic: {self.topic}")
+        
+        # DLQ Producer
+        self.dlq_producer = KafkaProducer(
+            bootstrap_servers=self.kafka_servers,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+            key_serializer=lambda k: str(k).encode('utf-8') if k else None,
+            acks='all',
+            retries=5
+        )
+        
+        logger.info(f"Kafka consumer and DLQ producer initialized")
     
     async def process_batch(self, messages: List[Dict[str, Any]]) -> bool:
-        """Process a batch of messages and store in database."""
+        """Process batch with idempotent upserts per specification."""
         if not messages:
             return True
         
         start_time = time.time()
-        batch_size_gauge.set(len(messages))
         
         try:
-            # Prepare data for batch insert
-            records = []
+            valid_messages = []
+            invalid_messages = []
+            
+            # Validate messages
             for msg in messages:
-                records.append((
-                    msg['user_id'],
-                    msg['type'],
-                    msg['timestamp'],
-                    json.dumps(msg['payload'])
-                ))
+                required_fields = ['event_id', 'user_id', 'source', 'type', 'event_ts', 'ingest_ts', 'payload']
+                if all(field in msg for field in required_fields):
+                    valid_messages.append(msg)
+                else:
+                    invalid_messages.append(msg)
+                    logger.warning(f"Invalid message structure: {msg}")
             
-            # Batch insert to database
-            insert_query = """
-            INSERT INTO signals (user_id, type, timestamp, payload)
-            VALUES ($1, $2, $3, $4::jsonb)
-            """
-
-            # Chunk and insert concurrently using the pool
-            chunk_size = 500
-            chunks = [records[i:i+chunk_size] for i in range(0, len(records), chunk_size)]
-            async def insert_chunk(chunk):
-                async with self.db_pool.acquire() as conn:
-                    await conn.executemany(insert_query, chunk)
-            await asyncio.gather(*(insert_chunk(c) for c in chunks))
+            # Send invalid messages to DLQ
+            for invalid_msg in invalid_messages:
+                await self.send_to_dlq(invalid_msg, "Invalid message structure")
             
-            # Record processing stats
-            processing_time_ms = int((time.time() - start_time) * 1000)
-            stats_query = """
-            INSERT INTO processing_stats (batch_size, processing_time_ms, events_count)
-            VALUES ($1, $2, $3)
+            if not valid_messages:
+                return True
+            
+            # Idempotent upsert per specification
+            upsert_query = """
+            INSERT INTO signals (id, user_id, source, type, event_ts, ingest_ts, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO NOTHING
             """
             
             async with self.db_pool.acquire() as conn:
-                await conn.execute(stats_query, len(messages), processing_time_ms, len(messages))
+                for msg in valid_messages:
+                    try:
+                        # Parse ISO timestamp strings to datetime objects
+                        event_ts = date_parser.parse(msg['event_ts'])
+                        ingest_ts = date_parser.parse(msg['ingest_ts'])
+                        
+                        await conn.execute(
+                            upsert_query,
+                            msg['event_id'],
+                            msg['user_id'],
+                            msg['source'],
+                            msg['type'],
+                            event_ts,
+                            ingest_ts,
+                            json.dumps(msg['payload'])
+                        )
+                    except Exception as e:
+                        logger.error(f"Database write error for event {msg['event_id']}: {e}")
+                        db_write_failures_total.inc()
+                        await self.send_to_dlq(msg, f"Database write error: {e}")
             
             # Update metrics
-            events_processed.labels(status='success').inc(len(messages))
-            processing_latency.observe(time.time() - start_time)
+            signals_consumed_total.inc(len(messages))
+            processing_latency_seconds.observe(time.time() - start_time)
             
-            logger.info(f"Processed batch of {len(messages)} events in {processing_time_ms}ms")
+            logger.info(f"Processed batch of {len(valid_messages)} valid events")
             return True
             
         except Exception as e:
             logger.error(f"Error processing batch: {e}")
-            events_processed.labels(status='error').inc(len(messages))
+            db_write_failures_total.inc(len(messages))
+            
+            # Send entire batch to DLQ on major failure
+            for msg in messages:
+                await self.send_to_dlq(msg, f"Batch processing error: {e}")
+            
             return False
     
-    async def handle_failed_messages(self, messages: List[Dict[str, Any]]):
-        """Handle messages that failed to process (Dead Letter Queue logic)."""
-        logger.warning(f"Handling {len(messages)} failed messages")
-        
-        # In a production system, you might:
-        # 1. Send to a dead letter topic
-        # 2. Store in a failed_events table
-        # 3. Send alerts
-        
+    async def send_to_dlq(self, message: Dict[str, Any], error_reason: str):
+        """Send message to DLQ topic."""
         try:
-            failed_events_query = """
-            CREATE TABLE IF NOT EXISTS failed_events (
-                id BIGSERIAL PRIMARY KEY,
-                original_message JSONB NOT NULL,
-                error_reason TEXT,
-                failed_at TIMESTAMP DEFAULT NOW(),
-                retry_count INTEGER DEFAULT 0
-            );
-            """
+            dlq_message = {
+                'original_message': message,
+                'error_reason': error_reason,
+                'failed_at': datetime.utcnow().isoformat()
+            }
             
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(failed_events_query)
-                
-                for msg in messages:
-                    await conn.execute(
-                        "INSERT INTO failed_events (original_message, error_reason) VALUES ($1, $2)",
-                        json.dumps(msg), "Processing failed"
-                    )
+            self.dlq_producer.send(
+                self.dlq_topic,
+                value=dlq_message,
+                key=message.get('user_id', 'unknown')
+            )
             
-            logger.info(f"Stored {len(messages)} failed messages in failed_events table")
+            signals_dlq_total.inc()
+            logger.info(f"Sent message to DLQ: {error_reason}")
             
         except Exception as e:
-            logger.error(f"Error handling failed messages: {e}")
+            logger.error(f"Error sending to DLQ: {e}")
     
     async def consume_and_process(self):
-        """Main consumer loop with batch processing."""
+        """Main consumer loop."""
         logger.info("Starting message consumption...")
         
         batch = []
-        last_commit = time.time()
-        commit_interval = 5.0  # Commit every 5 seconds
         
         try:
             while True:
@@ -217,59 +192,35 @@ class SignalProcessor:
                 
                 for topic_partition, messages in message_pack.items():
                     for message in messages:
-                        try:
-                            # Validate message structure
-                            required_fields = ['user_id', 'type', 'timestamp', 'payload']
-                            if not all(field in message.value for field in required_fields):
-                                logger.warning(f"Invalid message structure: {message.value}")
-                                continue
-                            
-                            batch.append(message.value)
-                            
-                            # Process batch when full
-                            if len(batch) >= self.batch_size:
-                                success = await self.process_batch(batch)
-                                if not success:
-                                    await self.handle_failed_messages(batch)
-                                batch = []
-                                
-                                # Commit offsets
-                                self.consumer.commit()
-                                last_commit = time.time()
+                        batch.append(message.value)
                         
-                        except Exception as e:
-                            logger.error(f"Error processing individual message: {e}")
-                            events_processed.labels(status='error').inc()
+                        # Process batch when full
+                        if len(batch) >= self.batch_size:
+                            await self.process_batch(batch)
+                            batch = []
+                            
+                            # Commit after successful DB write per specification
+                            self.consumer.commit()
                 
-                # Process remaining batch if timeout reached
-                current_time = time.time()
-                if batch and (current_time - last_commit) > commit_interval:
-                    success = await self.process_batch(batch)
-                    if not success:
-                        await self.handle_failed_messages(batch)
+                # Process remaining batch if any
+                if batch:
+                    await self.process_batch(batch)
                     batch = []
-                    
-                    # Commit offsets
                     self.consumer.commit()
-                    last_commit = current_time
                 
-                # Small sleep to prevent busy waiting
                 await asyncio.sleep(0.01)
                 
         except Exception as e:
             logger.error(f"Error in consumer loop: {e}")
             raise
         finally:
-            # Process any remaining messages
-            if batch:
-                await self.process_batch(batch)
-                self.consumer.commit()
-            
             if self.consumer:
                 self.consumer.close()
-                logger.info("Kafka consumer closed")
+            if self.dlq_producer:
+                self.dlq_producer.close()
+            logger.info("Kafka connections closed")
 
-# FastAPI app for health checks and metrics
+# FastAPI app for health checks only
 app = FastAPI(title="Signal Processor Service", version="1.0.0")
 
 # Global processor instance
@@ -285,46 +236,8 @@ async def health_check():
         "status": "healthy",
         "service": "signal-processor",
         "database": db_status,
-        "kafka": kafka_status,
-        "batch_size": int(os.getenv('BATCH_SIZE', '100'))
+        "kafka": kafka_status
     }
-
-@app.get("/metrics/custom")
-async def custom_metrics():
-    """Custom application metrics."""
-    if not processor or not processor.db_pool:
-        return {"error": "Database not initialized"}
-    
-    try:
-        async with processor.db_pool.acquire() as conn:
-            # Get processing statistics
-            stats = await conn.fetchrow("""
-                SELECT 
-                    COUNT(*) as total_events,
-                    AVG(processing_time_ms) as avg_processing_time_ms,
-                    MAX(processing_time_ms) as max_processing_time_ms
-                FROM processing_stats 
-                WHERE created_at > NOW() - INTERVAL '1 hour'
-            """)
-            
-            # Get recent signal counts by type
-            signal_counts = await conn.fetch("""
-                SELECT type, COUNT(*) as count
-                FROM signals 
-                WHERE created_at > NOW() - INTERVAL '1 hour'
-                GROUP BY type
-                ORDER BY count DESC
-            """)
-            
-            return {
-                "total_events_last_hour": stats['total_events'] or 0,
-                "avg_processing_time_ms": float(stats['avg_processing_time_ms'] or 0),
-                "max_processing_time_ms": stats['max_processing_time_ms'] or 0,
-                "signal_counts_by_type": [dict(row) for row in signal_counts]
-            }
-    except Exception as e:
-        logger.error(f"Error getting custom metrics: {e}")
-        return {"error": str(e)}
 
 @app.on_event("startup")
 async def startup_event():
@@ -338,7 +251,7 @@ async def startup_event():
     # Initialize processor
     processor = SignalProcessor()
     await processor.init_db_pool()
-    processor.init_kafka_consumer()
+    processor.init_kafka()
     
     # Start consumption in background
     asyncio.create_task(processor.consume_and_process())
@@ -350,9 +263,11 @@ async def shutdown_event():
     if processor:
         if processor.consumer:
             processor.consumer.close()
+        if processor.dlq_producer:
+            processor.dlq_producer.close()
         if processor.db_pool:
             await processor.db_pool.close()
     logger.info("Signal processor shutdown complete")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)

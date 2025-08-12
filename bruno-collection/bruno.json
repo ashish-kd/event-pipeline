@@ -1,0 +1,113 @@
+{
+  "version": "1",
+  "name": "Event Pipeline Testing",
+  "type": "collection",
+  "items": [
+    {
+      "uid": "health-checks",
+      "name": "Health Checks",
+      "type": "folder",
+      "items": [
+        {
+          "uid": "signal-emitter-health",
+          "name": "Signal Emitter Health",
+          "type": "http-request",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8001/health",
+            "headers": [
+              {"name": "Accept", "value": "application/json"}
+            ]
+          }
+        },
+        {
+          "uid": "signal-processor-health", 
+          "name": "Signal Processor Health",
+          "type": "http-request",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8002/health",
+            "headers": [
+              {"name": "Accept", "value": "application/json"}
+            ]
+          }
+        },
+        {
+          "uid": "anomaly-detector-health",
+          "name": "Anomaly Detector Health", 
+          "type": "http-request",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8003/health",
+            "headers": [
+              {"name": "Accept", "value": "application/json"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "metrics",
+      "name": "Prometheus Metrics",
+      "type": "folder", 
+      "items": [
+        {
+          "uid": "emitter-metrics",
+          "name": "Signal Emitter Metrics",
+          "type": "http-request",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8011/metrics",
+            "headers": [
+              {"name": "Accept", "value": "text/plain"}
+            ]
+          }
+        },
+        {
+          "uid": "processor-metrics",
+          "name": "Signal Processor Metrics", 
+          "type": "http-request",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8012/metrics",
+            "headers": [
+              {"name": "Accept", "value": "text/plain"}
+            ]
+          }
+        },
+        {
+          "uid": "anomaly-metrics",
+          "name": "Anomaly Detector Metrics",
+          "type": "http-request", 
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:8013/metrics",
+            "headers": [
+              {"name": "Accept", "value": "text/plain"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "uid": "testing",
+      "name": "Testing",
+      "type": "folder",
+      "items": [
+        {
+          "uid": "emit-signal",
+          "name": "Emit Signal (Manual Testing)",
+          "type": "http-request",
+          "request": {
+            "method": "POST",
+            "url": "http://localhost:8001/emit",
+            "headers": [
+              {"name": "Accept", "value": "application/json"},
+              {"name": "Content-Type", "value": "application/json"}
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

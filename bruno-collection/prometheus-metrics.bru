@@ -1,0 +1,15 @@
+meta {
+  name: Prometheus Metrics
+  type: http
+  seq: 4
+}
+
+get {
+  url: http://localhost:8011/metrics
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: text/plain
+}

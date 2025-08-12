@@ -63,10 +63,11 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SIGNALS_PER_SECOND: 1000
-      BURST_MODE: false
     networks:
       - event-pipeline
     ports:
@@ -83,6 +84,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventpipeline
@@ -103,6 +106,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventpipeline
@@ -112,21 +117,17 @@ services:
       - "8003:8000"
       - "8013:8001"
 
-  api:
-    build:
-      context: ./api
-      dockerfile: Dockerfile
-    container_name: api
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-init
     depends_on:
-      postgres:
+      kafka:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventpipeline
+    volumes:
+      - ./init-kafka-topics.sh:/init-kafka-topics.sh
+    command: ["/bin/bash", "/init-kafka-topics.sh"]
     networks:
       - event-pipeline
-    ports:
-      - "8000:8000"
-      - "8010:8001"
 
   prometheus:
     image: prom/prometheus:latest
@@ -135,6 +136,7 @@ services:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
