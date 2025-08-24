@@ -1,0 +1,72 @@
+{
+  "type": "record",
+  "name": "Signal",
+  "namespace": "com.eventpipeline.signals",
+  "doc": "Event signal schema for the event pipeline",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": "string",
+      "doc": "Unique identifier for the event (UUID)"
+    },
+    {
+      "name": "user_id", 
+      "type": "string",
+      "doc": "User identifier"
+    },
+    {
+      "name": "source",
+      "type": {
+        "type": "enum",
+        "name": "SignalSource",
+        "symbols": ["web", "mobile", "api"]
+      },
+      "doc": "Source of the signal"
+    },
+    {
+      "name": "type",
+      "type": {
+        "type": "enum", 
+        "name": "SignalType",
+        "symbols": ["login", "purchase", "click", "api_call", "file_access"]
+      },
+      "doc": "Type of the signal event"
+    },
+    {
+      "name": "event_ts",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      },
+      "doc": "Event timestamp in milliseconds since epoch"
+    },
+    {
+      "name": "ingest_ts",
+      "type": {
+        "type": "long", 
+        "logicalType": "timestamp-millis"
+      },
+      "doc": "Ingestion timestamp in milliseconds since epoch"
+    },
+    {
+      "name": "payload",
+      "type": {
+        "type": "record",
+        "name": "SignalPayload",
+        "fields": [
+          {
+            "name": "session_id",
+            "type": "string",
+            "doc": "Session identifier"
+          },
+          {
+            "name": "data",
+            "type": "string",
+            "doc": "Signal data content"
+          }
+        ]
+      },
+      "doc": "Signal payload containing session and data information"
+    }
+  ]
+}

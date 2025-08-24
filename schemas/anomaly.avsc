@@ -1,0 +1,42 @@
+{
+  "type": "record",
+  "name": "Anomaly",
+  "namespace": "com.eventpipeline.anomalies", 
+  "doc": "Anomaly detection result schema",
+  "fields": [
+    {
+      "name": "anomaly_type",
+      "type": {
+        "type": "enum",
+        "name": "AnomalyType", 
+        "symbols": ["high_data_value", "suspicious_session", "unusual_time_activity", "low_data_value"]
+      },
+      "doc": "Type of detected anomaly"
+    },
+    {
+      "name": "severity",
+      "type": "int",
+      "doc": "Severity level of the anomaly (1=low, 2=medium, 3=high)"
+    },
+    {
+      "name": "signal_event_id",
+      "type": "string",
+      "doc": "Reference to the original signal event ID"
+    },
+    {
+      "name": "detection_ts",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      },
+      "default": 0,
+      "doc": "Timestamp when anomaly was detected"
+    },
+    {
+      "name": "user_id",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "User ID from the original signal (optional)"
+    }
+  ]
+}

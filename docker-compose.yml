@@ -46,6 +46,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./monitoring/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c shared_preload_libraries=pg_stat_statements
     networks:
       - event-pipeline
     healthcheck:
@@ -65,8 +71,11 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
       SIGNALS_PER_SECOND: 1000
     networks:
       - event-pipeline
@@ -86,8 +95,11 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventpipeline
       BATCH_SIZE: 100
     networks:
@@ -108,8 +120,13 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
+      debezium-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventpipeline
     networks:
       - event-pipeline
@@ -126,6 +143,21 @@ services:
     volumes:
       - ./init-kafka-topics.sh:/init-kafka-topics.sh
     command: ["/bin/bash", "/init-kafka-topics.sh"]
+    networks:
+      - event-pipeline
+
+  schema-init:
+    image: python:3.11-slim
+    container_name: schema-init
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    volumes:
+      - ./register-schemas.py:/register-schemas.py
+      - ./schemas:/schemas
+    command: ["/bin/bash", "-c", "pip install requests && python /register-schemas.py"]
     networks:
       - event-pipeline
 
@@ -147,6 +179,94 @@ services:
       - '--web.enable-lifecycle'
     networks:
       - event-pipeline
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:29092'
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - event-pipeline
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  debezium-connect:
+    image: debezium/connect:2.4.2.Final
+    container_name: debezium-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: debezium-outbox
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_status
+      # Postgres connector settings
+      DATABASE_HOSTNAME: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_DBNAME: eventpipeline
+    networks:
+      - event-pipeline
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  debezium-init:
+    image: alpine:3.18
+    container_name: debezium-init
+    depends_on:
+      debezium-connect:
+        condition: service_healthy
+    volumes:
+      - ./configure-debezium.sh:/src/configure-debezium.sh:ro
+    command: ["/bin/sh", "-c", "apk add --no-cache curl && /bin/sh /src/configure-debezium.sh"]
+    networks:
+      - event-pipeline
+
+  dlq-recovery:
+    build:
+      context: ./dlq-recovery-service
+      dockerfile: Dockerfile
+    container_name: dlq-recovery
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      DLQ_MAX_RETRIES: 3
+      DLQ_BATCH_SIZE: 10
+      DLQ_RETRY_DELAY_BASE: 2.0
+      DLQ_RECOVERY_INTERVAL: 5.0
+    networks:
+      - event-pipeline
+    ports:
+      - "8005:8000"  # Health check and API
+      - "8015:8004"  # Prometheus metrics
 
   grafana:
     image: grafana/grafana:latest

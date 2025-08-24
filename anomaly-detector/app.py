@@ -8,10 +8,14 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any
 
 import asyncpg
-from kafka import KafkaConsumer, KafkaProducer
+from confluent_kafka import Consumer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.serialization import SerializationContext, MessageField
 from prometheus_client import Counter, Histogram, start_http_server
 import uvicorn
 from fastapi import FastAPI
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -23,23 +27,24 @@ logger = logging.getLogger(__name__)
 # Prometheus metrics per specification
 anomalies_detected_total = Counter('anomalies_detected_total', 'Total anomalies detected', ['type', 'severity'])
 detection_latency_seconds = Histogram('detection_latency_seconds', 'Detection latency in seconds')
+outbox_events_total = Counter('outbox_events_total', 'Total events written to outbox')
+outbox_write_failures_total = Counter('outbox_write_failures_total', 'Total outbox write failures')
 
 class AnomalyDetector:
     def __init__(self):
         self.kafka_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+        self.schema_registry_url = os.getenv('SCHEMA_REGISTRY_URL', 'http://localhost:8081')
         self.database_url = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/eventpipeline')
         self.input_topic = 'signal-events'
-        self.output_topic = 'anomaly-events'
         self.group_id = 'anomaly-detector'
         
         # Database connection pool
         self.db_pool = None
         
-        # Kafka consumer and producer
+        # Kafka consumer only (no producer - using outbox pattern)
         self.consumer = None
-        self.producer = None
         
-        logger.info("Anomaly detector initialized")
+        logger.info("Anomaly detector initialized with outbox pattern")
     
     async def init_db_pool(self):
         """Initialize database connection pool."""
@@ -57,29 +62,43 @@ class AnomalyDetector:
             raise
     
     def init_kafka(self):
-        """Initialize Kafka consumer and producer."""
-        # Consumer
-        self.consumer = KafkaConsumer(
-            self.input_topic,
-            bootstrap_servers=self.kafka_servers,
-            group_id=self.group_id,
-            value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-            key_deserializer=lambda k: k.decode('utf-8') if k else None,
-            auto_offset_reset='latest',
-            enable_auto_commit=True,
-            max_poll_records=50
+        """Initialize Schema Registry-aware consumer (outbox pattern - no producer needed)."""
+        # Initialize Schema Registry client
+        self.schema_registry_client = SchemaRegistryClient({'url': self.schema_registry_url})
+        
+        # Initialize value deserializer
+        self.value_deserializer = AvroDeserializer(
+            schema_registry_client=self.schema_registry_client,
+            schema_str=self._load_schema_str()
         )
         
-        # Producer for anomaly events
-        self.producer = KafkaProducer(
-            bootstrap_servers=self.kafka_servers,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            key_serializer=lambda k: str(k).encode('utf-8') if k else None,
-            acks='all',
-            retries=5
-        )
+        # Regular Kafka Consumer with manual deserialization
+        self.consumer = Consumer({
+            'bootstrap.servers': self.kafka_servers,
+            'group.id': self.group_id,
+            'auto.offset.reset': 'latest',
+            'enable.auto.commit': True,
+            'max.poll.interval.ms': 300000,  # 5 minutes
+        })
         
-        logger.info("Kafka consumer and producer initialized")
+        # Subscribe to signals topic
+        self.consumer.subscribe([self.input_topic])
+        
+        logger.info("Schema Registry-aware consumer initialized (using outbox pattern for publishing)")
+    
+    def _load_schema_str(self):
+        """Load Avro schema string from Schema Registry."""
+        try:
+            response = requests.get(f"{self.schema_registry_url}/subjects/signal-events-value/versions/latest")
+            if response.status_code == 200:
+                schema_data = response.json()
+                return schema_data['schema']
+            else:
+                logger.error(f"Failed to load schema: {response.status_code}")
+                raise Exception("Schema not found")
+        except Exception as e:
+            logger.error(f"Error loading schema: {e}")
+            raise
     
     def detect_anomalies(self, signal: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Simple anomaly detection logic based on actual payload structure."""
@@ -101,7 +120,8 @@ class AnomalyDetector:
             anomalies.append({
                 'anomaly_type': 'high_data_value',
                 'severity': 1,  # simple: all anomalies same severity
-                'signal_event_id': signal['event_id']
+                'signal_event_id': signal['event_id'],
+                'user_id': user_id
             })
         
         # Rule 2: Suspicious session pattern (session_id with repeating digits)
@@ -110,7 +130,8 @@ class AnomalyDetector:
             anomalies.append({
                 'anomaly_type': 'suspicious_session',
                 'severity': 1,  # simple: all anomalies same severity
-                'signal_event_id': signal['event_id']
+                'signal_event_id': signal['event_id'],
+                'user_id': user_id
             })
         
         # Rule 3: API activity during odd hours (based on current time)
@@ -121,7 +142,8 @@ class AnomalyDetector:
                 anomalies.append({
                     'anomaly_type': 'unusual_time_activity',
                     'severity': 1,  # simple: all anomalies same severity
-                    'signal_event_id': signal['event_id']
+                    'signal_event_id': signal['event_id'],
+                    'user_id': user_id
                 })
         
         # Rule 4: Low data value might indicate system issue
@@ -129,91 +151,162 @@ class AnomalyDetector:
             anomalies.append({
                 'anomaly_type': 'low_data_value',
                 'severity': 1,  # simple: all anomalies same severity
-                'signal_event_id': signal['event_id']
+                'signal_event_id': signal['event_id'],
+                'user_id': user_id
             })
         
         return anomalies
     
     async def process_signal(self, signal: Dict[str, Any]):
-        """Process a single signal for anomalies."""
+        """Process a single signal for anomalies using atomic outbox pattern."""
         start_time = time.time()
         
         try:
             anomalies = self.detect_anomalies(signal)
             
-            for anomaly in anomalies:
-                # Store in database
-                await self.store_anomaly(anomaly, signal)
-                
-                # Publish to Kafka per specification
-                await self.publish_anomaly(anomaly)
+            if anomalies:
+                # Atomic transaction: store anomaly + outbox event
+                await self.store_anomaly_atomic(anomalies, signal)
             
             # Record detection latency
             detection_latency_seconds.observe(time.time() - start_time)
             
         except Exception as e:
             logger.error(f"Error processing signal: {e}")
+            outbox_write_failures_total.inc()
     
-    async def store_anomaly(self, anomaly: Dict[str, Any], original_signal: Dict[str, Any]):
-        """Store anomaly in database per schema specification."""
+    async def store_anomaly_atomic(self, anomalies: List[Dict[str, Any]], original_signal: Dict[str, Any]):
+        """Store signal first, then anomalies and outbox events atomically in a single transaction."""
         try:
-            insert_query = """
+            # Define SQL queries
+            signal_upsert_query = """
+            INSERT INTO signals (id, user_id, source, type, event_ts, ingest_ts, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO NOTHING
+            """
+            
+            anomaly_insert_query = """
             INSERT INTO anomalies (id, user_id, anomaly_type, severity, detection_ts, signal_event_id, context)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             """
             
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    insert_query,
-                    str(uuid.uuid4()),  # UUID for anomaly ID
-                    original_signal.get('user_id'),
-                    anomaly['anomaly_type'],
-                    anomaly['severity'],
-                    datetime.now(timezone.utc),
-                    anomaly['signal_event_id'],
-                    json.dumps({'original_signal': original_signal})
-                )
+            outbox_insert_query = """
+            INSERT INTO outbox_events (event_type, aggregate_id, aggregate_type, payload, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            """
             
-            logger.info(f"Stored anomaly: {anomaly['anomaly_type']} for signal {anomaly['signal_event_id']}")
+            async with self.db_pool.acquire() as conn:
+                async with conn.transaction():  # Atomic transaction
+                    # 1. FIRST: Ensure signal exists in signals table (handles race condition)
+                    event_ts = original_signal['event_ts']
+                    ingest_ts = original_signal['ingest_ts']
+                    
+                    # Ensure timestamps have timezone info
+                    if event_ts.tzinfo is None:
+                        event_ts = event_ts.replace(tzinfo=timezone.utc)
+                    if ingest_ts.tzinfo is None:
+                        ingest_ts = ingest_ts.replace(tzinfo=timezone.utc)
+                    
+                    await conn.execute(
+                        signal_upsert_query,
+                        original_signal['event_id'],
+                        original_signal['user_id'],
+                        original_signal['source'],
+                        original_signal['type'],
+                        event_ts,
+                        ingest_ts,
+                        json.dumps(original_signal['payload'])
+                    )
+                    
+                    # 2. THEN: Store anomalies (FK constraint will now pass)
+                    for anomaly in anomalies:
+                        anomaly_id = str(uuid.uuid4())
+                        detection_ts = datetime.now(timezone.utc)
+                        
+                        # Simplified context for anomaly
+                        simple_context = {
+                            'signal_id': str(original_signal.get('event_id', '')),
+                            'signal_type': str(original_signal.get('type', '')),
+                            'user_id': str(original_signal.get('user_id', ''))
+                        }
+                        
+                        await conn.execute(
+                            anomaly_insert_query,
+                            anomaly_id,
+                            original_signal.get('user_id'),
+                            anomaly['anomaly_type'],
+                            anomaly['severity'],
+                            detection_ts,
+                            anomaly['signal_event_id'],
+                            json.dumps(simple_context)
+                        )
+                        
+                        # 3. Store event in outbox (same transaction)
+                        outbox_payload = {
+                            'anomaly_type': str(anomaly['anomaly_type']),
+                            'severity': int(anomaly['severity']),
+                            'signal_event_id': str(anomaly['signal_event_id']),
+                            'detection_ts': int(detection_ts.timestamp() * 1000),  # milliseconds
+                            'user_id': str(anomaly.get('user_id', '')),
+                            'anomaly_id': str(anomaly_id)
+                        }
+                        
+                        await conn.execute(
+                            outbox_insert_query,
+                            'anomaly_detected',  # event_type
+                            anomaly_id,          # aggregate_id
+                            'anomaly',           # aggregate_type
+                            json.dumps(outbox_payload),
+                            detection_ts
+                        )
+                        
+                        # Update metrics
+                        severity_str = ['low', 'medium', 'high'][min(anomaly['severity'], 2)]
+                        anomalies_detected_total.labels(
+                            type=anomaly['anomaly_type'],
+                            severity=severity_str
+                        ).inc()
+                        
+                        outbox_events_total.inc()
+                        
+                        logger.info(f"Stored anomaly: {anomaly['anomaly_type']} for signal {anomaly['signal_event_id']}")
             
         except Exception as e:
             logger.error(f"Error storing anomaly: {e}")
+            outbox_write_failures_total.inc()
+            raise
     
-    async def publish_anomaly(self, anomaly: Dict[str, Any]):
-        """Publish anomaly to Kafka topic per specification."""
-        try:
-            # Send to Kafka with exact format from specification
-            self.producer.send(
-                self.output_topic,
-                value=anomaly,
-                key=anomaly['signal_event_id']
-            )
-            
-            # Update metrics with type and severity labels
-            severity_str = ['low', 'medium', 'high'][min(anomaly['severity'], 2)]
-            anomalies_detected_total.labels(
-                type=anomaly['anomaly_type'],
-                severity=severity_str
-            ).inc()
-            
-            logger.info(f"Published anomaly: {anomaly['anomaly_type']}")
-            
-        except Exception as e:
-            logger.error(f"Error publishing anomaly: {e}")
+
     
     async def consume_and_detect(self):
-        """Main consumer loop for anomaly detection."""
+        """Main consumer loop for anomaly detection with Schema Registry-aware consumer."""
         logger.info("Starting anomaly detection...")
         
         try:
             while True:
-                message_pack = self.consumer.poll(timeout_ms=1000, max_records=50)
+                # Poll for messages
+                msg = self.consumer.poll(timeout=1.0)
                 
-                for topic_partition, messages in message_pack.items():
-                    for message in messages:
-                        await self.process_signal(message.value)
+                if msg is None:
+                    continue
                 
-                await asyncio.sleep(0.01)
+                if msg.error():
+                    logger.error(f"Consumer error: {msg.error()}")
+                    continue
+                
+                try:
+                    # Manually deserialize the message using Schema Registry
+                    deserialized_value = self.value_deserializer(
+                        msg.value(), 
+                        SerializationContext(msg.topic(), MessageField.VALUE)
+                    )
+                    await self.process_signal(deserialized_value)
+                    
+                except Exception as e:
+                    logger.error(f"Error deserializing message: {e}")
+                    # Continue processing other messages
+                
+                await asyncio.sleep(0.001)  # Small yield
                 
         except Exception as e:
             logger.error(f"Error in anomaly detection loop: {e}")
@@ -221,8 +314,6 @@ class AnomalyDetector:
         finally:
             if self.consumer:
                 self.consumer.close()
-            if self.producer:
-                self.producer.close()
 
 # FastAPI app for health checks only
 app = FastAPI(title="Anomaly Detector Service", version="1.0.0")
@@ -240,7 +331,8 @@ async def health_check():
         "status": "healthy",
         "service": "anomaly-detector",
         "database": db_status,
-        "kafka": kafka_status
+        "kafka": kafka_status,
+        "pattern": "outbox"
     }
 
 @app.on_event("startup")
@@ -267,8 +359,6 @@ async def shutdown_event():
     if detector:
         if detector.consumer:
             detector.consumer.close()
-        if detector.producer:
-            detector.producer.close()
         if detector.db_pool:
             await detector.db_pool.close()
     logger.info("Anomaly detector shutdown complete")

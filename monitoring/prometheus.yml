@@ -36,25 +36,3 @@ scrape_configs:
     scrape_interval: 5s
     scrape_timeout: 4s
 
-  
-
-  # Custom application endpoints for health checks
-  - job_name: 'signal-emitter-health'
-    static_configs:
-      - targets: ['signal-emitter:8000']
-    metrics_path: '/health'
-    scrape_interval: 30s
-
-  - job_name: 'signal-processor-health'
-    static_configs:
-      - targets: ['signal-processor:8000']
-    metrics_path: '/health'
-    scrape_interval: 30s
-
-  - job_name: 'anomaly-detector-health'
-    static_configs:
-      - targets: ['anomaly-detector:8000']
-    metrics_path: '/health'
-    scrape_interval: 30s
-
-  

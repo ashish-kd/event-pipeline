@@ -3,15 +3,18 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any
-from dateutil import parser as date_parser
 
 import asyncpg
-from kafka import KafkaConsumer, KafkaProducer
+from confluent_kafka import Consumer, Producer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroDeserializer, AvroSerializer
+from confluent_kafka.serialization import SerializationContext, MessageField
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 import uvicorn
 from fastapi import FastAPI
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +33,7 @@ signals_dlq_total = Counter('signals_dlq_total', 'Total signals sent to DLQ')
 class SignalProcessor:
     def __init__(self):
         self.kafka_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+        self.schema_registry_url = os.getenv('SCHEMA_REGISTRY_URL', 'http://localhost:8081')
         self.database_url = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/eventpipeline')
         self.batch_size = int(os.getenv('BATCH_SIZE', '100'))
         self.topic = 'signal-events'
@@ -61,29 +65,50 @@ class SignalProcessor:
             raise
     
     def init_kafka(self):
-        """Initialize Kafka consumer and DLQ producer."""
-        # Consumer
-        self.consumer = KafkaConsumer(
-            self.topic,
-            bootstrap_servers=self.kafka_servers,
-            group_id=self.group_id,
-            value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-            key_deserializer=lambda k: k.decode('utf-8') if k else None,
-            auto_offset_reset='latest',
-            enable_auto_commit=False,  # Per specification
-            max_poll_records=self.batch_size
+        """Initialize Schema Registry-aware consumer and DLQ producer."""
+        # Initialize Schema Registry client
+        self.schema_registry_client = SchemaRegistryClient({'url': self.schema_registry_url})
+        
+        # Initialize value deserializer
+        self.value_deserializer = AvroDeserializer(
+            schema_registry_client=self.schema_registry_client,
+            schema_str=self._load_schema_str()
         )
         
-        # DLQ Producer
-        self.dlq_producer = KafkaProducer(
-            bootstrap_servers=self.kafka_servers,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            key_serializer=lambda k: str(k).encode('utf-8') if k else None,
-            acks='all',
-            retries=5
-        )
+        # Regular Kafka Consumer with manual deserialization
+        self.consumer = Consumer({
+            'bootstrap.servers': self.kafka_servers,
+            'group.id': self.group_id,
+            'auto.offset.reset': 'latest',
+            'enable.auto.commit': False,  # Per specification
+            'max.poll.interval.ms': 300000,  # 5 minutes
+        })
         
-        logger.info(f"Kafka consumer and DLQ producer initialized")
+        # Subscribe to topic
+        self.consumer.subscribe([self.topic])
+        
+        # DLQ Producer (regular producer for error messages)
+        self.dlq_producer = Producer({
+            'bootstrap.servers': self.kafka_servers,
+            'acks': 'all',
+            'retries': 5
+        })
+        
+        logger.info(f"Schema Registry-aware consumer and DLQ producer initialized")
+    
+    def _load_schema_str(self):
+        """Load Avro schema string from Schema Registry."""
+        try:
+            response = requests.get(f"{self.schema_registry_url}/subjects/signal-events-value/versions/latest")
+            if response.status_code == 200:
+                schema_data = response.json()
+                return schema_data['schema']
+            else:
+                logger.error(f"Failed to load schema: {response.status_code}")
+                raise Exception("Schema not found")
+        except Exception as e:
+            logger.error(f"Error loading schema: {e}")
+            raise
     
     async def process_batch(self, messages: List[Dict[str, Any]]) -> bool:
         """Process batch with idempotent upserts per specification."""
@@ -93,38 +118,34 @@ class SignalProcessor:
         start_time = time.time()
         
         try:
-            valid_messages = []
-            invalid_messages = []
+            # Avro consumer already validated schema, so all messages are valid
+            # Just process them directly
             
-            # Validate messages
-            for msg in messages:
-                required_fields = ['event_id', 'user_id', 'source', 'type', 'event_ts', 'ingest_ts', 'payload']
-                if all(field in msg for field in required_fields):
-                    valid_messages.append(msg)
-                else:
-                    invalid_messages.append(msg)
-                    logger.warning(f"Invalid message structure: {msg}")
-            
-            # Send invalid messages to DLQ
-            for invalid_msg in invalid_messages:
-                await self.send_to_dlq(invalid_msg, "Invalid message structure")
-            
-            if not valid_messages:
-                return True
-            
-            # Idempotent upsert per specification
+            # Idempotent upsert with enrichment support
             upsert_query = """
             INSERT INTO signals (id, user_id, source, type, event_ts, ingest_ts, payload)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                payload = EXCLUDED.payload,
+                ingest_ts = CASE 
+                    WHEN EXCLUDED.ingest_ts > signals.ingest_ts 
+                    THEN EXCLUDED.ingest_ts 
+                    ELSE signals.ingest_ts 
+                END
             """
             
             async with self.db_pool.acquire() as conn:
-                for msg in valid_messages:
+                for msg in messages:
                     try:
-                        # Parse ISO timestamp strings to datetime objects
-                        event_ts = date_parser.parse(msg['event_ts'])
-                        ingest_ts = date_parser.parse(msg['ingest_ts'])
+                        # Timestamps are already datetime objects from Avro deserialization
+                        event_ts = msg['event_ts']
+                        ingest_ts = msg['ingest_ts']
+                        
+                        # Ensure they have timezone info
+                        if event_ts.tzinfo is None:
+                            event_ts = event_ts.replace(tzinfo=timezone.utc)
+                        if ingest_ts.tzinfo is None:
+                            ingest_ts = ingest_ts.replace(tzinfo=timezone.utc)
                         
                         await conn.execute(
                             upsert_query,
@@ -145,7 +166,7 @@ class SignalProcessor:
             signals_consumed_total.inc(len(messages))
             processing_latency_seconds.observe(time.time() - start_time)
             
-            logger.info(f"Processed batch of {len(valid_messages)} valid events")
+            logger.info(f"Processed batch of {len(messages)} events")
             return True
             
         except Exception as e:
@@ -159,18 +180,19 @@ class SignalProcessor:
             return False
     
     async def send_to_dlq(self, message: Dict[str, Any], error_reason: str):
-        """Send message to DLQ topic."""
+        """Send message to DLQ topic (as JSON since it's error data)."""
         try:
             dlq_message = {
                 'original_message': message,
                 'error_reason': error_reason,
-                'failed_at': datetime.utcnow().isoformat()
+                'failed_at': datetime.now(timezone.utc).isoformat()
             }
             
-            self.dlq_producer.send(
-                self.dlq_topic,
-                value=dlq_message,
-                key=message.get('user_id', 'unknown')
+            # Use produce with JSON serialization for DLQ
+            self.dlq_producer.produce(
+                topic=self.dlq_topic,
+                value=json.dumps(dlq_message).encode('utf-8'),
+                key=message.get('user_id', 'unknown').encode('utf-8') if message.get('user_id') else b'unknown'
             )
             
             signals_dlq_total.inc()
@@ -180,7 +202,7 @@ class SignalProcessor:
             logger.error(f"Error sending to DLQ: {e}")
     
     async def consume_and_process(self):
-        """Main consumer loop."""
+        """Main consumer loop with Schema Registry-aware consumer."""
         logger.info("Starting message consumption...")
         
         batch = []
@@ -188,27 +210,45 @@ class SignalProcessor:
         try:
             while True:
                 # Poll for messages
-                message_pack = self.consumer.poll(timeout_ms=1000, max_records=self.batch_size)
+                msg = self.consumer.poll(timeout=1.0)
                 
-                for topic_partition, messages in message_pack.items():
-                    for message in messages:
-                        batch.append(message.value)
+                if msg is None:
+                    # No message received, process any pending batch
+                    if batch:
+                        await self.process_batch(batch)
+                        batch = []
+                        self.consumer.commit()
+                    continue
+                
+                if msg.error():
+                    logger.error(f"Consumer error: {msg.error()}")
+                    continue
+                
+                try:
+                    # Manually deserialize the message using Schema Registry
+                    deserialized_value = self.value_deserializer(
+                        msg.value(), 
+                        SerializationContext(msg.topic(), MessageField.VALUE)
+                    )
+                    batch.append(deserialized_value)
+                    
+                    # Update consumer lag metric
+                    consumer_lag.set(0)  # Simplified for now
+                    
+                    # Process batch when full
+                    if len(batch) >= self.batch_size:
+                        await self.process_batch(batch)
+                        batch = []
                         
-                        # Process batch when full
-                        if len(batch) >= self.batch_size:
-                            await self.process_batch(batch)
-                            batch = []
-                            
-                            # Commit after successful DB write per specification
-                            self.consumer.commit()
+                        # Commit after successful DB write per specification
+                        self.consumer.commit()
+                        
+                except Exception as e:
+                    logger.error(f"Error deserializing message: {e}")
+                    # Send to DLQ if deserialization fails
+                    await self.send_to_dlq({"raw_message": "deserialization_failed"}, f"Deserialization error: {e}")
                 
-                # Process remaining batch if any
-                if batch:
-                    await self.process_batch(batch)
-                    batch = []
-                    self.consumer.commit()
-                
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.001)  # Small yield
                 
         except Exception as e:
             logger.error(f"Error in consumer loop: {e}")
@@ -216,8 +256,6 @@ class SignalProcessor:
         finally:
             if self.consumer:
                 self.consumer.close()
-            if self.dlq_producer:
-                self.dlq_producer.close()
             logger.info("Kafka connections closed")
 
 # FastAPI app for health checks only

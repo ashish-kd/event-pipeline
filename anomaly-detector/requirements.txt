@@ -1,4 +1,4 @@
-kafka-python==2.0.2
+confluent-kafka[avro]==2.3.0
 fastapi==0.104.1
 uvicorn==0.24.0
 prometheus-client==0.19.0
