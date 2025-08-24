@@ -6,39 +6,42 @@
 -- =============================================================================
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "btree_gin";  -- For mixed GIN indexes
+CREATE EXTENSION IF NOT EXISTS "pg_partman";  -- For automated partition management
 
 -- =============================================================================
 -- CORE TABLES
 -- =============================================================================
 
--- signals table per specification
+-- signals table per specification (partitioned for production scaling)
 CREATE TABLE IF NOT EXISTS signals (
-    id UUID PRIMARY KEY,
+    id UUID,
     user_id TEXT,
     source TEXT,
     type TEXT,
-    event_ts TIMESTAMPTZ,
+    event_ts TIMESTAMPTZ NOT NULL,
     ingest_ts TIMESTAMPTZ,
-    payload JSONB
-);
+    payload JSONB,
+    PRIMARY KEY (id, event_ts)  -- Include partition key in PK
+) PARTITION BY RANGE (event_ts);
 
--- anomalies table per specification
+-- anomalies table per specification (partitioned for production scaling)
 CREATE TABLE IF NOT EXISTS anomalies (
-    id UUID PRIMARY KEY,
+    id UUID,
     user_id TEXT,
     anomaly_type TEXT,
     severity INT,
-    detection_ts TIMESTAMPTZ,
-    signal_event_id UUID REFERENCES signals(id),
-    context JSONB
-);
+    detection_ts TIMESTAMPTZ NOT NULL,
+    signal_event_id UUID,  -- FK constraint added later due to partitioning
+    context JSONB,
+    PRIMARY KEY (id, detection_ts)  -- Include partition key in PK
+) PARTITION BY RANGE (detection_ts);
 
 -- outbox_events table for transactional guarantees (Debezium CDC)
 CREATE TABLE IF NOT EXISTS outbox_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_type TEXT NOT NULL,
-    aggregate_id TEXT NOT NULL,
-    aggregate_type TEXT NOT NULL,
+    aggregatetype TEXT NOT NULL,     -- Debezium expects this exact name
+    aggregateid TEXT NOT NULL,       -- Debezium expects this exact name
+    eventtype TEXT NOT NULL,         -- Debezium expects this exact name
     payload JSONB NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     processed_at TIMESTAMPTZ NULL
@@ -281,6 +284,53 @@ $$ LANGUAGE plpgsql;
 
 -- Update table statistics for optimal query planning
 SELECT refresh_table_stats();
+
+-- =============================================================================
+-- AUTOMATED PARTITION MANAGEMENT (PRODUCTION SCALING)
+-- =============================================================================
+
+-- Setup automated partitioning for signals (monthly partitions)
+SELECT partman.create_parent(
+    p_parent_table => 'public.signals',
+    p_control => 'event_ts', 
+    p_type => 'range',
+    p_interval => 'monthly',
+    p_premake => 3,  -- Pre-create 3 future partitions
+    p_start_partition => '2024-01-01'::timestamp
+);
+
+-- Setup automated partitioning for anomalies (monthly partitions)
+SELECT partman.create_parent(
+    p_parent_table => 'public.anomalies',
+    p_control => 'detection_ts',
+    p_type => 'range', 
+    p_interval => 'monthly',
+    p_premake => 3,  -- Pre-create 3 future partitions
+    p_start_partition => '2024-01-01'::timestamp
+);
+
+-- Configure automatic partition cleanup (retain 12 months)
+UPDATE partman.part_config 
+SET infinite_time_partitions = false,
+    retention = '12 months',
+    retention_keep_table = false,
+    retention_keep_index = false
+WHERE parent_table IN ('public.signals', 'public.anomalies');
+
+-- Create partition cleanup function for maintenance
+CREATE OR REPLACE FUNCTION cleanup_old_partitions()
+RETURNS TEXT AS $$
+BEGIN
+    -- Run partman maintenance (drops old partitions based on retention policy)
+    PERFORM partman.run_maintenance();
+    
+    -- Update table statistics after cleanup
+    ANALYZE signals;
+    ANALYZE anomalies;
+    
+    RETURN 'Partition cleanup completed';
+END;
+$$ LANGUAGE plpgsql;
 
 -- =============================================================================
 -- GRANT PERMISSIONS

@@ -191,7 +191,7 @@ class AnomalyDetector:
             """
             
             outbox_insert_query = """
-            INSERT INTO outbox_events (event_type, aggregate_id, aggregate_type, payload, created_at)
+            INSERT INTO outbox_events (eventtype, aggregateid, aggregatetype, payload, created_at)
             VALUES ($1, $2, $3, $4, $5)
             """
             

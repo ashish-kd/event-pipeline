@@ -36,3 +36,11 @@ scrape_configs:
     scrape_interval: 5s
     scrape_timeout: 4s
 
+  # DLQ Recovery Service
+  - job_name: 'dlq-recovery'
+    static_configs:
+      - targets: ['dlq-recovery:8004']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 4s
+

@@ -45,6 +45,7 @@ class DLQRecoveryService:
         self.schema_registry_url = os.getenv('SCHEMA_REGISTRY_URL', 'http://localhost:8081')
         self.dlq_topic = 'signal-events-dlq'
         self.main_topic = 'signal-events'
+        self.quarantine_topic = 'signal-events-quarantine'
         self.group_id = 'dlq-recovery-service'
         
         # Intelligent retry configuration
@@ -56,6 +57,7 @@ class DLQRecoveryService:
         # Kafka consumers and producers
         self.dlq_consumer = None
         self.main_producer = None
+        self.quarantine_producer = None
         self.schema_registry_client = None
         self.value_serializer = None
         
@@ -115,6 +117,15 @@ class DLQRecoveryService:
             'max.in.flight.requests.per.connection': 1  # Ensure ordering
         })
         
+        # Quarantine Producer (sends permanent failures to quarantine)
+        self.quarantine_producer = Producer({
+            'bootstrap.servers': self.kafka_servers,
+            'acks': 'all',
+            'retries': 5,
+            'retry.backoff.ms': 1000,
+            'max.in.flight.requests.per.connection': 1
+        })
+        
         # Subscribe to DLQ topic
         self.dlq_consumer.subscribe([self.dlq_topic])
         
@@ -159,30 +170,83 @@ class DLQRecoveryService:
         # Default: treat as temporary for safety
         return 'temporary'
     
-    def should_retry_message(self, dlq_message: Dict[str, Any], retry_count: int) -> bool:
-        """Intelligent retry logic - handles different failure types."""
+    def should_retry_message(self, dlq_message: Dict[str, Any], retry_count: int) -> str:
+        """Intelligent retry logic - returns 'retry', 'quarantine', or 'skip'."""
         error_reason = dlq_message.get('error_reason', '')
         failure_type = self.classify_failure_type(error_reason)
         
-        # Don't retry if max retries exceeded
+        # Don't retry if max retries exceeded - send to quarantine
         if retry_count >= self.max_retries:
-            logger.info(f"🛑 Max retries ({self.max_retries}) exceeded for message")
-            return False
+            logger.info(f"🛑 Max retries ({self.max_retries}) exceeded - sending to quarantine")
+            return 'quarantine'
         
-        # Don't retry permanent failures
+        # Don't retry permanent failures - send to quarantine immediately
         if failure_type == 'permanent':
-            logger.info(f"🚫 Skipping permanent failure: {error_reason}")
+            logger.info(f"🚫 Permanent failure detected - sending to quarantine: {error_reason}")
             self.recovery_stats['permanent_failures'] += 1
             dlq_messages_failed_total.labels(failure_type='permanent').inc()
-            return False
+            return 'quarantine'
         
         # Retry temporary failures
         if failure_type == 'temporary':
             logger.info(f"🔄 Retrying temporary failure (attempt {retry_count + 1}): {error_reason}")
             self.recovery_stats['temporary_failures'] += 1
-            return True
+            return 'retry'
         
-        return True
+        return 'retry'
+    
+    async def send_to_quarantine(self, dlq_message: Dict[str, Any], retry_count: int, final_error: str):
+        """Send permanently failed message to quarantine topic with audit headers."""
+        try:
+            original_message = dlq_message.get('original_message', {})
+            error_reason = dlq_message.get('error_reason', 'Unknown')
+            
+            # Create quarantine record with full audit trail
+            quarantine_record = {
+                'original_message': original_message,
+                'dlq_metadata': {
+                    'original_error': error_reason,
+                    'final_error': final_error,
+                    'retry_count': retry_count,
+                    'max_retries': self.max_retries,
+                    'failure_classification': self.classify_failure_type(error_reason),
+                    'quarantined_at': datetime.now(timezone.utc).isoformat(),
+                    'quarantine_reason': 'max_retries_exceeded' if retry_count >= self.max_retries else 'permanent_failure'
+                },
+                'recovery_service': 'automated-dlq-recovery'
+            }
+            
+            # Kafka headers for audit trail and processing hints
+            headers = [
+                ('dlq.retry.count', str(retry_count).encode()),
+                ('dlq.error.class', self.classify_failure_type(error_reason).encode()),
+                ('dlq.quarantine.reason', quarantine_record['dlq_metadata']['quarantine_reason'].encode()),
+                ('dlq.quarantined.at', quarantine_record['dlq_metadata']['quarantined_at'].encode()),
+                ('dlq.original.error', error_reason.encode()),
+                ('dlq.service.version', '1.0.0'.encode()),
+                ('schema.version', '1'.encode())
+            ]
+            
+            # Send to quarantine topic
+            self.quarantine_producer.produce(
+                topic=self.quarantine_topic,
+                value=json.dumps(quarantine_record).encode('utf-8'),
+                key=original_message.get('user_id', 'unknown').encode('utf-8') if original_message.get('user_id') else b'unknown',
+                headers=headers
+            )
+            
+            self.quarantine_producer.flush()
+            
+            # Log for audit trail
+            logger.info(f"🗂️  Quarantined message: {original_message.get('event_id', 'unknown')} after {retry_count} retries")
+            logger.info(f"   Reason: {quarantine_record['dlq_metadata']['quarantine_reason']}")
+            logger.info(f"   Error: {error_reason}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to send message to quarantine: {e}")
+            return False
     
     def calculate_retry_delay(self, retry_count: int) -> float:
         """Calculate exponential backoff delay for intelligent retry logic."""
@@ -192,8 +256,10 @@ class DLQRecoveryService:
         jitter = random.uniform(0.1, 0.3) * delay  # 10-30% jitter
         return delay + jitter
     
-    async def replay_message(self, dlq_message: Dict[str, Any], retry_count: int = 0) -> bool:
-        """Replay a single message from DLQ to main topic with intelligent retry logic."""
+    async def replay_message(self, dlq_message: Dict[str, Any], retry_count: int = 0) -> str:
+        """Replay a single message from DLQ to main topic with intelligent retry logic.
+        Returns: 'success', 'quarantined', 'failed'
+        """
         start_time = time.time()
         
         try:
@@ -201,8 +267,12 @@ class DLQRecoveryService:
             error_reason = dlq_message.get('error_reason', 'Unknown')
             
             # Check if we should retry this message
-            if not self.should_retry_message(dlq_message, retry_count):
-                return False
+            action = self.should_retry_message(dlq_message, retry_count)
+            if action == 'quarantine':
+                await self.send_to_quarantine(dlq_message, retry_count, error_reason)
+                return 'quarantined'
+            elif action != 'retry':
+                return 'failed'
             
             # Track retry attempts
             dlq_retry_attempts_total.labels(retry_count=str(retry_count)).inc()
@@ -238,11 +308,22 @@ class DLQRecoveryService:
                 # Fallback to JSON serialization
                 serialized_value = json.dumps(enhanced_message).encode('utf-8')
             
-            # Send to main topic
+            # Kafka headers for audit trail and replay tracking
+            headers = [
+                ('dlq.retry.count', str(retry_count).encode()),
+                ('dlq.error.class', self.classify_failure_type(error_reason).encode()),
+                ('dlq.replayed.at', datetime.now(timezone.utc).isoformat().encode()),
+                ('dlq.service.version', '1.0.0'.encode()),
+                ('dlq.original.error', error_reason.encode()),
+                ('schema.version', '1'.encode())
+            ]
+            
+            # Send to main topic with headers
             self.main_producer.produce(
                 topic=self.main_topic,
                 value=serialized_value,
-                key=original_message.get('user_id', 'unknown').encode('utf-8') if original_message.get('user_id') else b'unknown'
+                key=original_message.get('user_id', 'unknown').encode('utf-8') if original_message.get('user_id') else b'unknown',
+                headers=headers
             )
             
             # Flush to ensure delivery
@@ -253,7 +334,7 @@ class DLQRecoveryService:
             dlq_recovery_latency_seconds.observe(time.time() - start_time)
             
             logger.info(f"✅ Successfully replayed message (retry {retry_count}): {original_message.get('event_id', 'unknown')}")
-            return True
+            return 'success'
             
         except Exception as e:
             dlq_messages_failed_total.labels(failure_type='replay_error').inc()
@@ -265,8 +346,10 @@ class DLQRecoveryService:
                 logger.info(f"⏳ Scheduling retry {retry_count + 1} in {retry_delay:.1f}s")
                 await asyncio.sleep(retry_delay)
                 return await self.replay_message(dlq_message, retry_count + 1)
-            
-            return False
+            else:
+                # Send to quarantine if max retries exceeded
+                await self.send_to_quarantine(dlq_message, retry_count, str(e))
+                return 'quarantined'
     
     async def monitor_and_recover(self):
         """Main recovery loop - zero manual intervention, fully automated."""
@@ -321,6 +404,8 @@ class DLQRecoveryService:
                 self.dlq_consumer.close()
             if self.main_producer:
                 self.main_producer.close()
+            if self.quarantine_producer:
+                self.quarantine_producer.close()
             logger.info("🛑 Automated DLQ Recovery Service shutdown complete")
     
     async def process_dlq_batch(self, messages: list):
@@ -343,10 +428,13 @@ class DLQRecoveryService:
                 dlq_data = json.loads(message.value().decode('utf-8'))
                 
                 # Attempt to replay with intelligent retry logic
-                success = await self.replay_message(dlq_data)
+                result = await self.replay_message(dlq_data)
                 
-                if success:
+                if result == 'success':
                     batch_stats['replayed'] += 1
+                elif result == 'quarantined':
+                    batch_stats['failed'] += 1
+                    logger.info(f"   ✅ Message quarantined (permanent failure): {dlq_data.get('original_message', {}).get('event_id', 'unknown')}")
                 else:
                     batch_stats['failed'] += 1
                     
@@ -478,6 +566,8 @@ async def shutdown_event():
             recovery_service.dlq_consumer.close()
         if recovery_service.main_producer:
             recovery_service.main_producer.close()
+        if recovery_service.quarantine_producer:
+            recovery_service.quarantine_producer.close()
     logger.info("🛑 Automated DLQ Recovery Service shutdown complete")
 
 if __name__ == "__main__":

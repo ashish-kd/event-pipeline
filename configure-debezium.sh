@@ -3,7 +3,7 @@
 
 set -e
 
-DEBEZIUM_URL="http://localhost:8083"
+DEBEZIUM_URL="http://debezium-connect:8083"
 MAX_RETRIES=30
 RETRY_INTERVAL=5
 
@@ -43,11 +43,9 @@ configure_outbox_connector() {
         "table.include.list": "public.outbox_events",
         "transforms": "outbox",
         "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
-        "transforms.outbox.table.fields.additional.placement": "aggregate_id:header:aggregateId,aggregate_type:header:aggregateType",
         "transforms.outbox.route.topic.replacement": "anomaly-events",
         "transforms.outbox.table.field.event.id": "id",
-        "transforms.outbox.table.field.event.key": "aggregate_id",
-        "transforms.outbox.table.field.event.timestamp": "created_at",
+        "transforms.outbox.table.field.event.key": "aggregateid",
         "transforms.outbox.table.field.event.payload": "payload",
         "plugin.name": "pgoutput",
         "slot.name": "debezium_outbox_slot",
@@ -92,7 +90,7 @@ main() {
     echo ""
     echo "🎉 Debezium Outbox Connector configured successfully!"
     echo "📊 Connector will now publish outbox events to 'anomaly-events' topic"
-    echo "🔍 Monitor status: curl $DEBEZIUM_URL/connectors/outbox-connector/status"
+    echo "🔍 Monitor status: curl http://localhost:8083/connectors/outbox-connector/status"
 }
 
 main "$@"

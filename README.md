@@ -104,9 +104,9 @@ CREATE TABLE anomalies (
 -- outbox_events table (transactional guarantees)
 CREATE TABLE outbox_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_type TEXT NOT NULL,              -- "anomaly_detected"
-    aggregate_id TEXT NOT NULL,            -- anomaly ID
-    aggregate_type TEXT NOT NULL,          -- "anomaly"
+    eventtype TEXT NOT NULL,               -- "anomaly_detected"
+    aggregateid TEXT NOT NULL,             -- anomaly ID
+    aggregatetype TEXT NOT NULL,           -- "anomaly"
     payload JSONB NOT NULL,                -- anomaly event data
     created_at TIMESTAMPTZ DEFAULT NOW(),  -- when event was created
     processed_at TIMESTAMPTZ NULL          -- when Debezium processed it
@@ -122,6 +122,13 @@ CREATE TABLE outbox_events (
 - ✅ **Prometheus** metrics on ports 8011-8013
 - ✅ **Grafana** dashboard with throughput, latency, consumer lag
 - ✅ **Alert rules** for high lag, DLQ rate, DB failures
+
+### **Security Features** (Optional)
+- ✅ **JWT Authentication**: Centralized auth service with token management
+- ✅ **Rate Limiting**: Multi-layer rate limiting with DDoS protection
+- ✅ **TLS/HTTPS**: Traefik load balancer with automatic certificate management
+- ✅ **Structured Logging**: JSON logs with correlation IDs
+- ✅ **API Key Protection**: Simple API key auth for /emit endpoint
 
 ## 🚀 Quick Start
 
@@ -141,7 +148,8 @@ make db-stats
 ### **Manual Testing**
 ```bash
 # Manual signal emission (NEW!)
-curl -X POST http://localhost:8001/emit
+curl -X POST http://localhost:8001/emit \
+  -H "X-API-Key: dev-test-key-123"
 
 # Health checks
 curl http://localhost:8001/health  # Signal Emitter
@@ -294,16 +302,24 @@ curl http://localhost:8083/connectors/outbox-connector/status
 - **Signal Processor**: http://localhost:8002 (health)
 - **Anomaly Detector**: http://localhost:8003 (health + outbox pattern)
 - **DLQ Recovery**: http://localhost:8005 (health + automated recovery stats)
+- **Auth Service**: http://localhost:8004 (JWT authentication)
+- **Traefik Dashboard**: http://localhost:8080 (load balancer)
 
 ## Configuration (Env Vars)
 - `KAFKA_BOOTSTRAP_SERVERS` (default: `kafka:29092`)
 - `DATABASE_URL` (default: `postgresql://postgres:postgres@postgres:5432/eventpipeline`)
 - `SIGNALS_PER_SECOND` (default: `1000`)
 - `BATCH_SIZE` (default: `100`)
+- `JWT_SECRET_KEY` (default: `super-secret-jwt-key-change-in-production`)
+- `REDIS_PASSWORD` (default: `redis123`)
+- `EMIT_API_KEY` (default: `dev-test-key-123`)
 
 ## Data Model (Minimal)
 - `signals(id, user_id, type, timestamp, payload, ...)`
 - `anomalies(id, user_id, anomaly_type, severity, detection_timestamp, ...)`
 
 ## Notes
-- Local stack includes Kafka (KRaft, no ZK), Postgres, Prometheus; Grafana is optional but provisioned in compose.
+- Local stack includes Kafka (KRaft, no ZK), Postgres, Prometheus, Redis, and optional security services
+- Grafana is optional but provisioned in compose
+- Security features (JWT auth, rate limiting, TLS) are included but not required for basic functionality
+- All services use pinned Docker image versions for consistency

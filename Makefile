@@ -70,14 +70,21 @@ kafka-topics:
 	@echo "Kafka topics:"
 	docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 --list
 
-# DLQ replay (requires kafka-python locally)
-dlq-inspect:
-	@echo "Inspecting DLQ messages..."
-	@python3 dlq-replay.py --dry-run --max-messages 10
+# DLQ Recovery Service commands
+dlq-status:
+	@echo "Checking automated DLQ recovery status..."
+	@curl -s http://localhost:8005/health | jq . || echo "DLQ Recovery Service: DOWN"
 
-dlq-replay:
-	@echo "Replaying DLQ messages..."
-	@python3 dlq-replay.py --max-messages 50
+dlq-stats:
+	@echo "DLQ Recovery Statistics:"
+	@curl -s http://localhost:8005/stats | jq . || echo "Stats not available"
+
+dlq-metrics:
+	@echo "DLQ Recovery Metrics Summary:"
+	@curl -s http://localhost:8005/metrics-summary | jq . || echo "Metrics not available"
+
+logs-dlq:
+	docker compose logs -f dlq-recovery
 
 # Outbox pattern monitoring
 outbox-status:
@@ -88,7 +95,7 @@ outbox-status:
 	@echo "=== Outbox Events in Database ==="
 	docker compose exec postgres psql -U postgres -d eventpipeline -c "SELECT COUNT(*) as pending_events FROM outbox_events WHERE processed_at IS NULL;"
 	@echo "=== Recent Outbox Events ==="
-	docker compose exec postgres psql -U postgres -d eventpipeline -c "SELECT event_type, aggregate_id, created_at FROM outbox_events ORDER BY created_at DESC LIMIT 5;"
+	docker compose exec postgres psql -U postgres -d eventpipeline -c "SELECT eventtype, aggregateid, created_at FROM outbox_events ORDER BY created_at DESC LIMIT 5;"
 
 debezium-config:
 	@echo "Reconfiguring Debezium connector..."
@@ -109,24 +116,10 @@ help:
 	@echo "  health        Check service health endpoints"
 	@echo "  db-stats      View database statistics"
 	@echo "  kafka-topics  List Kafka topics"
-	@echo "  dlq-inspect   Inspect DLQ messages (dry run)"
-	@echo "  dlq-replay    Replay DLQ messages back to main topic"
+	@echo "  dlq-status    Check automated DLQ recovery status"
+	@echo "  dlq-stats     View DLQ recovery statistics"
+	@echo "  dlq-metrics   View DLQ recovery metrics summary"
+	@echo "  logs-dlq      View DLQ recovery service logs"
 	@echo "  outbox-status Check outbox pattern and Debezium status"
 	@echo "  debezium-config Reconfigure Debezium connector"
 	@echo "  help          Show this help"
-
-# DLQ Recovery Service commands
-dlq-status:
-	@echo "Checking automated DLQ recovery status..."
-	@curl -s http://localhost:8005/health | jq . || echo "DLQ Recovery Service: DOWN"
-
-dlq-stats:
-	@echo "DLQ Recovery Statistics:"
-	@curl -s http://localhost:8005/stats | jq . || echo "Stats not available"
-
-dlq-metrics:
-	@echo "DLQ Recovery Metrics Summary:"
-	@curl -s http://localhost:8005/metrics-summary | jq . || echo "Metrics not available"
-
-logs-dlq:
-	docker compose logs -f dlq-recovery

@@ -1,6 +1,78 @@
-version: '3.8'
+# Removed version: '3.8' - no longer required in modern Docker Compose
 
 services:
+  # Redis for session management and caching
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis123}
+    volumes:
+      - redis_data:/data
+    networks:
+      - event-pipeline
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis123}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Traefik for TLS termination and load balancing
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./security/tls-config.yml:/etc/traefik/traefik.yml
+      - ./certs:/certs
+    networks:
+      - event-pipeline
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.letsencrypt.acme.email=admin@example.com
+      - --certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json
+
+  # JWT Authentication Service
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-super-secret-jwt-key-change-in-production}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis123}
+      SERVICE_NAME: auth-service
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - event-pipeline
+    ports:
+      - "8004:8000"  # Auth API
+      - "8014:8001"  # Prometheus metrics
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.auth-service.rule=Host(`localhost`) && PathPrefix(`/auth`)"
+      - "traefik.http.routers.auth-service.entrypoints=websecure"
+      - "traefik.http.routers.auth-service.tls.certresolver=letsencrypt"
+
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     hostname: kafka
@@ -76,7 +148,10 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
-      SIGNALS_PER_SECOND: 1000
+      SIGNALS_PER_SECOND: ${SIGNALS_PER_SECOND:-1000}
+      PRODUCER_BATCH_SIZE: ${PRODUCER_BATCH_SIZE:-100}
+      PRODUCER_LINGER_MS: ${PRODUCER_LINGER_MS:-5}
+      PRODUCER_COMPRESSION_TYPE: ${PRODUCER_COMPRESSION_TYPE:-snappy}
     networks:
       - event-pipeline
     ports:
@@ -101,7 +176,12 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/eventpipeline
-      BATCH_SIZE: 100
+      BATCH_SIZE: ${PROCESSOR_BATCH_SIZE:-100}
+      MAX_POLL_RECORDS: ${PROCESSOR_MAX_POLL_RECORDS:-500}
+      FETCH_MIN_BYTES: ${CONSUMER_FETCH_MIN_BYTES:-1024}
+      FETCH_MAX_WAIT_MS: ${CONSUMER_FETCH_MAX_WAIT_MS:-5}
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-5}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-20}
     networks:
       - event-pipeline
     ports:
@@ -162,7 +242,7 @@ services:
       - event-pipeline
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.47.0
     container_name: prometheus
     ports:
       - "9090:9090"
@@ -269,7 +349,7 @@ services:
       - "8015:8004"  # Prometheus metrics
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:10.1.5
     container_name: grafana
     ports:
       - "3000:3000"
@@ -290,3 +370,4 @@ volumes:
   postgres_data:
   prometheus_data:
   grafana_data:
+  redis_data:

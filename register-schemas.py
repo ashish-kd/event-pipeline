@@ -61,11 +61,57 @@ def register_schema(subject, schema_file):
         logger.error(f"Error registering schema for {subject}: {e}")
         return False
 
+def set_global_compatibility():
+    """Set global compatibility level to BACKWARD for safe evolution."""
+    try:
+        response = requests.put(
+            f"{SCHEMA_REGISTRY_URL}/config",
+            json={"compatibility": "BACKWARD"},
+            headers={'Content-Type': 'application/vnd.schemaregistry.v1+json'}
+        )
+        
+        if response.status_code == 200:
+            logger.info("✅ Global compatibility set to BACKWARD")
+            return True
+        else:
+            logger.error(f"❌ Failed to set global compatibility: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Error setting global compatibility: {e}")
+        return False
+
+def set_subject_compatibility(subject, compatibility_level="BACKWARD"):
+    """Set compatibility level for specific subject."""
+    try:
+        response = requests.put(
+            f"{SCHEMA_REGISTRY_URL}/config/{subject}",
+            json={"compatibility": compatibility_level},
+            headers={'Content-Type': 'application/vnd.schemaregistry.v1+json'}
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"✅ Subject {subject} compatibility set to {compatibility_level}")
+            return True
+        else:
+            logger.error(f"❌ Failed to set {subject} compatibility: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Error setting {subject} compatibility: {e}")
+        return False
+
 def main():
-    """Register all schemas."""
+    """Register all schemas and configure governance."""
     if not wait_for_schema_registry():
         sys.exit(1)
     
+    # 1. Configure schema governance first
+    logger.info("🔧 Configuring Schema Registry Governance")
+    governance_success = True
+    
+    if not set_global_compatibility():
+        governance_success = False
+    
+    # 2. Register schemas
     schemas_to_register = [
         ("signal-events-value", "schemas/signal.avsc"),
         ("anomaly-events-value", "schemas/anomaly.avsc")
@@ -75,9 +121,15 @@ def main():
     for subject, schema_file in schemas_to_register:
         if not register_schema(subject, schema_file):
             success = False
+            
+        # Set subject-specific compatibility after registration
+        if not set_subject_compatibility(subject, "BACKWARD"):
+            governance_success = False
     
-    if success:
-        logger.info("All schemas registered successfully")
+    if success and governance_success:
+        logger.info("All schemas registered successfully with governance configured")
+        logger.info("✅ Compatibility enforcement: BACKWARD")
+        logger.info("✅ Evolution policy: Safe backward-compatible changes only")
         
         # List registered schemas
         response = requests.get(f"{SCHEMA_REGISTRY_URL}/subjects")
@@ -85,7 +137,7 @@ def main():
             subjects = response.json()
             logger.info(f"Registered subjects: {subjects}")
     else:
-        logger.error("Some schemas failed to register")
+        logger.error("Some schemas failed to register or governance configuration failed")
         sys.exit(1)
 
 if __name__ == '__main__':

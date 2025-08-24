@@ -1,0 +1,87 @@
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment and Config
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.pytest_cache/
+
+# Logs
+*.log
+logs/
+log/
+
+# Docker
+.docker/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Local development
+docker-compose.override.yml
+performance-config.env
+local-config.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Reports and artifacts
+optimization_report_*.txt
+test-results/
+coverage/
+
+# Node modules (if any)
+node_modules/
+
+# Compiled binaries
+*.exe
+*.dll
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
+# JetBrains
+.idea/
+
+# Local test files
+test-*.py.local
+*-local.*
